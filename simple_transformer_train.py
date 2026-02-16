@@ -1,200 +1,222 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
+import torch.nn.functional as F
+import math
+import random
 import os
+import sentencepiece as spm
 
-# =====================
-# CONFIG
-# =====================
+# ========================
+# Config
+# ========================
 
-SEQ_LEN = 32
-BATCH_SIZE = 192   # increased batch size thanks to FP16
-EMBED_DIM = 128
-HEADS = 4
-LAYERS = 3
+BATCH_SIZE = 32
+SEQ_LEN = 128
+EPOCHS = 2000
 LR = 3e-4
-EPOCHS = 50
-CHECKPOINT_PATH = "checkpoint.pt"
-DATASET_PATH = "dataset.txt"
+
+D_MODEL = 256
+NUM_HEADS = 8
+NUM_LAYERS = 6
+
+GENERATE_LEN = 300
+
+TOKENIZER_MODEL = "spm.model"
+MODEL_FILE = "gpt_subword_model.pt"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 print("Using device:", device)
 
-# =====================
-# LOAD DATASET
-# =====================
+# ========================
+# Prepare SentencePiece tokenizer
+# ========================
 
-with open(DATASET_PATH, "r", encoding="utf-8") as f:
+if not os.path.exists(TOKENIZER_MODEL):
+    print("Training SentencePiece tokenizer...")
+    spm.SentencePieceTrainer.Train(
+        input="dataset.txt",
+        model_prefix="spm",
+        vocab_size=5000,      # subword vocab size
+        model_type="bpe",     # BPE tokenizer
+        character_coverage=1.0
+    )
+
+sp = spm.SentencePieceProcessor()
+sp.Load(TOKENIZER_MODEL)
+
+vocab_size = sp.GetPieceSize()
+print("Tokenizer vocab size:", vocab_size)
+
+# Encode entire dataset
+with open("dataset.txt", "r", encoding="utf-8") as f:
     text = f.read()
 
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
+data = torch.tensor(sp.EncodeAsIds(text), dtype=torch.long)
+print("Dataset length (tokens):", len(data))
 
-char_to_idx = {ch: i for i, ch in enumerate(chars)}
-idx_to_char = {i: ch for i, ch in enumerate(chars)}
 
-data = torch.tensor([char_to_idx[c] for c in text], dtype=torch.long)
+# ========================
+# Batch generator
+# ========================
 
-# =====================
-# DATASET
-# =====================
+def get_batch():
+    x_batch, y_batch = [], []
+    for _ in range(BATCH_SIZE):
+        start = random.randint(0, len(data) - SEQ_LEN - 1)
+        x = data[start:start + SEQ_LEN]
+        y = data[start + 1:start + SEQ_LEN + 1]
+        x_batch.append(x)
+        y_batch.append(y)
+    return torch.stack(x_batch).to(device), torch.stack(y_batch).to(device)
 
-class TextDataset(Dataset):
 
-    def __init__(self, data, seq_len):
-        self.data = data
-        self.seq_len = seq_len
+# ========================
+# Positional Encoding
+# ========================
 
-    def __len__(self):
-        return len(self.data) - self.seq_len
-
-    def __getitem__(self, idx):
-
-        x = self.data[idx:idx+SEQ_LEN]
-        y = self.data[idx+1:idx+SEQ_LEN+1]
-
-        return x, y
-
-dataset = TextDataset(data, SEQ_LEN)
-
-loader = DataLoader(
-    dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    pin_memory=True,
-    num_workers=2
-)
-
-print("Total sequences:", len(dataset))
-
-# =====================
-# MODEL
-# =====================
-
-class TransformerModel(nn.Module):
-
-    def __init__(self):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
         super().__init__()
-
-        self.embedding = nn.Embedding(vocab_size, EMBED_DIM)
-
-        self.pos_embedding = nn.Embedding(SEQ_LEN, EMBED_DIM)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=EMBED_DIM,
-            nhead=HEADS,
-            dim_feedforward=EMBED_DIM*4,
-            batch_first=True
-        )
-
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=LAYERS
-        )
-
-        self.norm = nn.LayerNorm(EMBED_DIM)
-
-        self.fc = nn.Linear(EMBED_DIM, vocab_size)
-
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))
     def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
 
-        positions = torch.arange(0, x.size(1), device=x.device)
 
-        x = self.embedding(x) + self.pos_embedding(positions)
+# ========================
+# Masked Multi-Head Attention
+# ========================
 
-        x = self.transformer(x)
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.qkv = nn.Linear(d_model, d_model * 3)
+        self.fc = nn.Linear(d_model, d_model)
+    def forward(self, x):
+        B, T, C = x.shape
+        qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
+        mask = torch.tril(torch.ones(T, T, device=x.device))
+        scores = scores.masked_fill(mask == 0, float("-inf"))
+        weights = F.softmax(scores, dim=-1)
+        out = weights @ v
+        out = out.transpose(1, 2).reshape(B, T, C)
+        return self.fc(out)
 
-        x = self.norm(x)
 
-        x = self.fc(x)
+# ========================
+# Feed Forward
+# ========================
 
+class FeedForward(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+# ========================
+# Transformer Block
+# ========================
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = MultiHeadAttention(d_model, num_heads)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ff = FeedForward(d_model)
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
         return x
 
 
-model = TransformerModel().to(device)
+# ========================
+# GPT Model
+# ========================
 
+class GPT(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, D_MODEL)
+        self.pos = PositionalEncoding(D_MODEL)
+        self.blocks = nn.Sequential(*[TransformerBlock(D_MODEL, NUM_HEADS) for _ in range(NUM_LAYERS)])
+        self.norm = nn.LayerNorm(D_MODEL)
+        self.fc = nn.Linear(D_MODEL, vocab_size)
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.pos(x)
+        x = self.blocks(x)
+        x = self.norm(x)
+        logits = self.fc(x)
+        return logits
+
+
+# ========================
+# Initialize model
+# ========================
+
+model = GPT().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-
 loss_fn = nn.CrossEntropyLoss()
 
-# AMP scaler
-scaler = torch.cuda.amp.GradScaler()
+if os.path.exists(MODEL_FILE):
+    print("Loading saved model...")
+    model.load_state_dict(torch.load(MODEL_FILE))
 
-start_epoch = 0
 
-# =====================
-# LOAD CHECKPOINT
-# =====================
+# ========================
+# Training loop
+# ========================
 
-if os.path.exists(CHECKPOINT_PATH):
+print("Training...")
 
-    print("Loading checkpoint...")
+for step in range(EPOCHS):
+    x, y = get_batch()
+    logits = model(x)
+    loss = loss_fn(logits.view(-1, vocab_size), y.view(-1))
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
 
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+    if step % 100 == 0:
+        print(f"Step {step}, Loss: {loss.item():.4f}")
+        torch.save(model.state_dict(), MODEL_FILE)
 
-    model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
 
-    start_epoch = checkpoint["epoch"]
+# ========================
+# Text generation
+# ========================
 
-    print("Resuming from epoch", start_epoch)
+def generate(start_text):
+    model.eval()
+    tokens = sp.EncodeAsIds(start_text)
+    x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
+    for _ in range(GENERATE_LEN):
+        logits = model(x)
+        last = logits[:, -1, :]
+        probs = F.softmax(last, dim=-1)
+        next_token = torch.multinomial(probs, 1)
+        x = torch.cat([x, next_token], dim=1)
+        if x.size(1) > SEQ_LEN:
+            x = x[:, -SEQ_LEN:]
+    return sp.DecodeIds(x.squeeze().tolist())
 
-# =====================
-# TRAINING LOOP
-# =====================
-
-print("Training started...")
-
-for epoch in range(start_epoch, EPOCHS):
-
-    total_loss = 0
-
-    progress = tqdm(loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-
-    for x, y in progress:
-
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        optimizer.zero_grad()
-
-        # FP16 forward
-        with torch.cuda.amp.autocast():
-
-            output = model(x)
-
-            loss = loss_fn(
-                output.view(-1, vocab_size),
-                y.view(-1)
-            )
-
-        # FP16 backward
-        scaler.scale(loss).backward()
-
-        scaler.unscale_(optimizer)
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-        scaler.step(optimizer)
-
-        scaler.update()
-
-        total_loss += loss.item()
-
-        progress.set_postfix(loss=loss.item())
-
-    avg_loss = total_loss / len(loader)
-
-    print(f"Epoch {epoch+1} Loss: {avg_loss:.4f}")
-
-    torch.save({
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "epoch": epoch+1,
-        "char_to_idx": char_to_idx,
-        "idx_to_char": idx_to_char
-    }, CHECKPOINT_PATH)
-
-print("Training complete!")
+print("\nGenerated text:\n")
+print(generate("The "))
