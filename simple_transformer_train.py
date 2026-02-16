@@ -1,143 +1,200 @@
-# ===============================
-# Transformer Training on TPU/GPU
-# ===============================
-
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import os
 
-# -----------------------------
-# Detect device: GPU or TPU
-# -----------------------------
-try:
-    import torch_xla.core.xla_model as xm
-    device = xm.xla_device()
-    use_tpu = True
-    print(f"Using TPU device: {device}")
-except ImportError:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_tpu = False
-    print(f"Using device: {device}")
+# =====================
+# CONFIG
+# =====================
 
-# -----------------------------
-# Load dataset
-# -----------------------------
-with open("dataset.txt", "r", encoding="utf-8") as f:
+SEQ_LEN = 32
+BATCH_SIZE = 192   # increased batch size thanks to FP16
+EMBED_DIM = 128
+HEADS = 4
+LAYERS = 3
+LR = 3e-4
+EPOCHS = 50
+CHECKPOINT_PATH = "checkpoint.pt"
+DATASET_PATH = "dataset.txt"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("Using device:", device)
+
+# =====================
+# LOAD DATASET
+# =====================
+
+with open(DATASET_PATH, "r", encoding="utf-8") as f:
     text = f.read()
 
-# -----------------------------
-# Vocabulary
-# -----------------------------
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
-char_to_idx = {ch:i for i,ch in enumerate(chars)}
-idx_to_char = {i:ch for i,ch in enumerate(chars)}
 
-# -----------------------------
-# Encode dataset
-# -----------------------------
+char_to_idx = {ch: i for i, ch in enumerate(chars)}
+idx_to_char = {i: ch for i, ch in enumerate(chars)}
+
 data = torch.tensor([char_to_idx[c] for c in text], dtype=torch.long)
 
-# -----------------------------
-# Create sequences with stride
-# -----------------------------
-seq_len = 8
-stride = 4  # skip every 4 characters to reduce number of sequences
+# =====================
+# DATASET
+# =====================
 
-X = []
-Y = []
+class TextDataset(Dataset):
 
-for i in range(0, len(data) - seq_len, stride):
-    X.append(data[i:i+seq_len])
-    Y.append(data[i+1:i+seq_len+1])
+    def __init__(self, data, seq_len):
+        self.data = data
+        self.seq_len = seq_len
 
-X = torch.stack(X)
-Y = torch.stack(Y)
+    def __len__(self):
+        return len(self.data) - self.seq_len
 
-print(f"Number of sequences: {len(X)}")
+    def __getitem__(self, idx):
 
-# -----------------------------
-# Dataset & DataLoader
-# -----------------------------
-batch_size = 128  # increase on TPU for speed
-dataset = TensorDataset(X, Y)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        x = self.data[idx:idx+SEQ_LEN]
+        y = self.data[idx+1:idx+SEQ_LEN+1]
 
-# -----------------------------
-# Transformer Model
-# -----------------------------
-class SimpleTransformer(nn.Module):
+        return x, y
+
+dataset = TextDataset(data, SEQ_LEN)
+
+loader = DataLoader(
+    dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    pin_memory=True,
+    num_workers=2
+)
+
+print("Total sequences:", len(dataset))
+
+# =====================
+# MODEL
+# =====================
+
+class TransformerModel(nn.Module):
+
     def __init__(self):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, 32)
-        self.pos_embedding = nn.Embedding(100, 32)  # max seq_len = 100
+
+        self.embedding = nn.Embedding(vocab_size, EMBED_DIM)
+
+        self.pos_embedding = nn.Embedding(SEQ_LEN, EMBED_DIM)
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=32,
-            nhead=4,
+            d_model=EMBED_DIM,
+            nhead=HEADS,
+            dim_feedforward=EMBED_DIM*4,
             batch_first=True
         )
+
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
-            num_layers=2
+            num_layers=LAYERS
         )
-        self.fc = nn.Linear(32, vocab_size)
+
+        self.norm = nn.LayerNorm(EMBED_DIM)
+
+        self.fc = nn.Linear(EMBED_DIM, vocab_size)
 
     def forward(self, x):
-        positions = torch.arange(x.size(1), device=x.device)
+
+        positions = torch.arange(0, x.size(1), device=x.device)
+
         x = self.embedding(x) + self.pos_embedding(positions)
+
         x = self.transformer(x)
+
+        x = self.norm(x)
+
         x = self.fc(x)
+
         return x
 
-# -----------------------------
-# Initialize model, optimizer, loss
-# -----------------------------
-model = SimpleTransformer().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+model = TransformerModel().to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+
 loss_fn = nn.CrossEntropyLoss()
 
-# Mixed precision for TPU
-if use_tpu:
-    model = model.to(dtype=torch.bfloat16)
+# AMP scaler
+scaler = torch.cuda.amp.GradScaler()
 
-# -----------------------------
-# Training loop
-# -----------------------------
-epochs = 10  # adjust as needed
+start_epoch = 0
+
+# =====================
+# LOAD CHECKPOINT
+# =====================
+
+if os.path.exists(CHECKPOINT_PATH):
+
+    print("Loading checkpoint...")
+
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+
+    start_epoch = checkpoint["epoch"]
+
+    print("Resuming from epoch", start_epoch)
+
+# =====================
+# TRAINING LOOP
+# =====================
+
 print("Training started...")
 
-for epoch in range(epochs):
-    epoch_loss = 0
-    for xb, yb in tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}"):
-        xb, yb = xb.to(device), yb.to(device)
-        if use_tpu:
-            xb = xb.to(dtype=torch.bfloat16)
+for epoch in range(start_epoch, EPOCHS):
+
+    total_loss = 0
+
+    progress = tqdm(loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+
+    for x, y in progress:
+
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        output = model(xb)
-        loss = loss_fn(output.view(-1, vocab_size), yb.view(-1))
-        loss.backward()
 
-        if use_tpu:
-            import torch_xla.core.xla_model as xm
-            xm.optimizer_step(optimizer)
-        else:
-            optimizer.step()
+        # FP16 forward
+        with torch.cuda.amp.autocast():
 
-        epoch_loss += loss.item() * xb.size(0)
+            output = model(x)
 
-    avg_loss = epoch_loss / len(dataset)
-    print(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.4f}")
+            loss = loss_fn(
+                output.view(-1, vocab_size),
+                y.view(-1)
+            )
 
-    # -----------------------------
-    # Save checkpoint
-    # -----------------------------
+        # FP16 backward
+        scaler.scale(loss).backward()
+
+        scaler.unscale_(optimizer)
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        scaler.step(optimizer)
+
+        scaler.update()
+
+        total_loss += loss.item()
+
+        progress.set_postfix(loss=loss.item())
+
+    avg_loss = total_loss / len(loader)
+
+    print(f"Epoch {epoch+1} Loss: {avg_loss:.4f}")
+
     torch.save({
-        "model_state_dict": model.state_dict(),
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch+1,
         "char_to_idx": char_to_idx,
         "idx_to_char": idx_to_char
-    }, f"checkpoint_epoch{epoch+1}.pt")
+    }, CHECKPOINT_PATH)
 
 print("Training complete!")

@@ -1,83 +1,110 @@
 import torch
 import torch.nn as nn
 
-# -----------------------------
-# Load trained model & mappings
-# -----------------------------
-checkpoint = torch.load("checkpoint_epoch10.pt", map_location="cpu")
+SEQ_LEN = 32
+EMBED_DIM = 128
+HEADS = 4
+LAYERS = 3
+CHECKPOINT_PATH = "checkpoint.pt"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("Using device:", device)
+
+checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+
 char_to_idx = checkpoint["char_to_idx"]
 idx_to_char = checkpoint["idx_to_char"]
 
 vocab_size = len(char_to_idx)
 
-# -----------------------------
-# Device
-# -----------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+# =====================
+# MODEL
+# =====================
 
-# -----------------------------
-# Model definition (same as training)
-# -----------------------------
-class SimpleTransformer(nn.Module):
+class TransformerModel(nn.Module):
+
     def __init__(self):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, 32)
-        self.pos_embedding = nn.Embedding(100, 32)
+
+        self.embedding = nn.Embedding(vocab_size, EMBED_DIM)
+        self.pos_embedding = nn.Embedding(SEQ_LEN, EMBED_DIM)
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=32,
-            nhead=4,
+            d_model=EMBED_DIM,
+            nhead=HEADS,
+            dim_feedforward=EMBED_DIM*4,
             batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        self.fc = nn.Linear(32, vocab_size)
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=LAYERS
+        )
+
+        self.norm = nn.LayerNorm(EMBED_DIM)
+        self.fc = nn.Linear(EMBED_DIM, vocab_size)
 
     def forward(self, x):
-        positions = torch.arange(x.size(1), device=x.device)
+
+        positions = torch.arange(0, x.size(1), device=x.device)
+
         x = self.embedding(x) + self.pos_embedding(positions)
+
         x = self.transformer(x)
+
+        x = self.norm(x)
+
         x = self.fc(x)
+
         return x
 
-# -----------------------------
-# Load model state
-# -----------------------------
-model = SimpleTransformer().to(device)
-model.load_state_dict(checkpoint["model_state_dict"])
-model.eval()  # evaluation mode
 
-# -----------------------------
-# Text generation function
-# -----------------------------
-def generate_text(model, start_text, length=200, temperature=1.0):
-    model.eval()
-    generated = list(start_text)
-    input_seq = torch.tensor([char_to_idx[c] for c in start_text], dtype=torch.long, device=device)
-    input_seq = input_seq.unsqueeze(0)  # [1, seq_len]
+model = TransformerModel().to(device)
+model.load_state_dict(checkpoint["model"])
+model.eval()
+
+# =====================
+# GENERATE FUNCTION
+# =====================
+
+def generate(prompt, length=500, temperature=0.7):
+
+    input_seq = torch.tensor(
+        [char_to_idx[c] for c in prompt],
+        dtype=torch.long
+    ).unsqueeze(0).to(device)
+
+    output_text = prompt
 
     for _ in range(length):
-        if input_seq.size(1) > 8:  # maintain seq_len=8
-            input_seq = input_seq[:, -8:]
+
+        input_cut = input_seq[:, -SEQ_LEN:]
 
         with torch.no_grad():
-            logits = model(input_seq)
-            logits = logits[:, -1, :] / temperature  # focus on last character
+
+            logits = model(input_cut)
+
+            logits = logits[:, -1, :] / temperature
+
             probs = torch.softmax(logits, dim=-1)
-            next_idx = torch.multinomial(probs, num_samples=1)
-            next_idx = next_idx.view(1, 1)  # fix shape to [1, 1]
 
-            next_char = idx_to_char[next_idx.item()]
-            generated.append(next_char)
-            input_seq = torch.cat([input_seq, next_idx], dim=1)
+            next_char = torch.multinomial(probs, 1)
 
-    return "".join(generated)
+        input_seq = torch.cat([input_seq, next_char], dim=1)
+
+        output_text += idx_to_char[next_char.item()]
+
+    return output_text
 
 
-# -----------------------------
-# Example usage
-# -----------------------------
-prompt = "Once upon a time"
-generated_text = generate_text(model, prompt, length=300, temperature=0.6)
-print("=== Generated Text ===")
-print(generated_text)
+# =====================
+# INTERACTIVE PROMPT
+# =====================
+
+prompt = input("Enter prompt: ")
+
+generated = generate(prompt, length=500, temperature=0.7)
+
+print("\nGenerated:\n")
+print(generated)
