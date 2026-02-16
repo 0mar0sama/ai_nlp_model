@@ -10,19 +10,22 @@ import sentencepiece as spm
 # Config
 # ========================
 
-BATCH_SIZE = 32
-SEQ_LEN = 128
-EPOCHS = 2000
+BATCH_SIZE = 64
+SEQ_LEN = 256
+EPOCHS = 5000
 LR = 3e-4
 
-D_MODEL = 256
+D_MODEL = 512
 NUM_HEADS = 8
-NUM_LAYERS = 6
+NUM_LAYERS = 8
 
-GENERATE_LEN = 300
+GENERATE_LEN = 500
 
-TOKENIZER_MODEL = "spm.model"
-MODEL_FILE = "gpt_subword_model.pt"
+TOKENIZER_MODEL = "spm_large.model"
+MODEL_FILE = "gpt_subword_large.pt"
+
+TEMPERATURE = 0.8  # controls randomness
+TOP_K = 50         # top-k sampling
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -35,9 +38,9 @@ if not os.path.exists(TOKENIZER_MODEL):
     print("Training SentencePiece tokenizer...")
     spm.SentencePieceTrainer.Train(
         input="dataset.txt",
-        model_prefix="spm",
-        vocab_size=5000,      # subword vocab size
-        model_type="bpe",     # BPE tokenizer
+        model_prefix="spm_large",
+        vocab_size=10000,      # larger subword vocab for bigger dataset
+        model_type="bpe",
         character_coverage=1.0
     )
 
@@ -47,13 +50,12 @@ sp.Load(TOKENIZER_MODEL)
 vocab_size = sp.GetPieceSize()
 print("Tokenizer vocab size:", vocab_size)
 
-# Encode entire dataset
+# Encode dataset
 with open("dataset.txt", "r", encoding="utf-8") as f:
     text = f.read()
 
 data = torch.tensor(sp.EncodeAsIds(text), dtype=torch.long)
 print("Dataset length (tokens):", len(data))
-
 
 # ========================
 # Batch generator
@@ -68,7 +70,6 @@ def get_batch():
         x_batch.append(x)
         y_batch.append(y)
     return torch.stack(x_batch).to(device), torch.stack(y_batch).to(device)
-
 
 # ========================
 # Positional Encoding
@@ -85,7 +86,6 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe.unsqueeze(0))
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
-
 
 # ========================
 # Masked Multi-Head Attention
@@ -113,7 +113,6 @@ class MultiHeadAttention(nn.Module):
         out = out.transpose(1, 2).reshape(B, T, C)
         return self.fc(out)
 
-
 # ========================
 # Feed Forward
 # ========================
@@ -128,7 +127,6 @@ class FeedForward(nn.Module):
         )
     def forward(self, x):
         return self.net(x)
-
 
 # ========================
 # Transformer Block
@@ -145,7 +143,6 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.norm1(x))
         x = x + self.ff(self.norm2(x))
         return x
-
 
 # ========================
 # GPT Model
@@ -167,7 +164,6 @@ class GPT(nn.Module):
         logits = self.fc(x)
         return logits
 
-
 # ========================
 # Initialize model
 # ========================
@@ -179,7 +175,6 @@ loss_fn = nn.CrossEntropyLoss()
 if os.path.exists(MODEL_FILE):
     print("Loading saved model...")
     model.load_state_dict(torch.load(MODEL_FILE))
-
 
 # ========================
 # Training loop
@@ -194,29 +189,36 @@ for step in range(EPOCHS):
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-
     if step % 100 == 0:
         print(f"Step {step}, Loss: {loss.item():.4f}")
         torch.save(model.state_dict(), MODEL_FILE)
 
-
 # ========================
-# Text generation
+# Text generation with temperature and top-k
 # ========================
 
-def generate(start_text):
+def generate(start_text, temperature=TEMPERATURE, top_k=TOP_K):
     model.eval()
     tokens = sp.EncodeAsIds(start_text)
     x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
     for _ in range(GENERATE_LEN):
         logits = model(x)
         last = logits[:, -1, :]
-        probs = F.softmax(last, dim=-1)
+        last = last / temperature
+        if top_k > 0:
+            top_values, top_indices = torch.topk(last, top_k)
+            probs = torch.zeros_like(last).scatter_(-1, top_indices, F.softmax(top_values, dim=-1))
+        else:
+            probs = F.softmax(last, dim=-1)
         next_token = torch.multinomial(probs, 1)
         x = torch.cat([x, next_token], dim=1)
         if x.size(1) > SEQ_LEN:
             x = x[:, -SEQ_LEN:]
     return sp.DecodeIds(x.squeeze().tolist())
 
+# ========================
+# Generate sample
+# ========================
+
 print("\nGenerated text:\n")
-print(generate("The "))
+print(generate("Once upon a time "))
