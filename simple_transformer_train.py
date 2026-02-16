@@ -5,52 +5,54 @@ import math
 import random
 import os
 import sentencepiece as spm
+from torch.cuda.amp import autocast, GradScaler
 
 # ========================
 # Config
 # ========================
-
-BATCH_SIZE = 64
+BATCH_SIZE = 32         # GPU memory safe batch
+ACCUM_STEPS = 4         # Gradient accumulation
 SEQ_LEN = 256
 EPOCHS = 5000
 LR = 3e-4
 
 D_MODEL = 512
 NUM_HEADS = 8
-NUM_LAYERS = 8
+NUM_LAYERS = 4
 
-GENERATE_LEN = 500
+GENERATE_LEN = 300
 
 TOKENIZER_MODEL = "spm_large.model"
-MODEL_FILE = "gpt_subword_large.pt"
+MODEL_FILE = "gpt_subword_large_amp.pt"
 
-TEMPERATURE = 0.8  # controls randomness
-TOP_K = 50         # top-k sampling
+TEMPERATURE = 0.8
+TOP_K = 50
+TOP_P = 0.9
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 # ========================
-# Prepare SentencePiece tokenizer
+# Tokenizer
 # ========================
-
 if not os.path.exists(TOKENIZER_MODEL):
     print("Training SentencePiece tokenizer...")
     spm.SentencePieceTrainer.Train(
         input="dataset.txt",
         model_prefix="spm_large",
-        vocab_size=10000,      # larger subword vocab for bigger dataset
+        vocab_size=10000,
         model_type="bpe",
         character_coverage=1.0
     )
 
 sp = spm.SentencePieceProcessor()
 sp.Load(TOKENIZER_MODEL)
-
 vocab_size = sp.GetPieceSize()
 print("Tokenizer vocab size:", vocab_size)
 
-# Encode dataset
+# ========================
+# Load dataset
+# ========================
 with open("dataset.txt", "r", encoding="utf-8") as f:
     text = f.read()
 
@@ -60,7 +62,6 @@ print("Dataset length (tokens):", len(data))
 # ========================
 # Batch generator
 # ========================
-
 def get_batch():
     x_batch, y_batch = [], []
     for _ in range(BATCH_SIZE):
@@ -72,9 +73,8 @@ def get_batch():
     return torch.stack(x_batch).to(device), torch.stack(y_batch).to(device)
 
 # ========================
-# Positional Encoding
+# Model Components
 # ========================
-
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
@@ -87,10 +87,6 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         return x + self.pe[:, :x.size(1)]
 
-# ========================
-# Masked Multi-Head Attention
-# ========================
-
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
@@ -102,9 +98,7 @@ class MultiHeadAttention(nn.Module):
         B, T, C = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q, k, v = [t.transpose(1, 2) for t in (q, k, v)]
         scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
         mask = torch.tril(torch.ones(T, T, device=x.device))
         scores = scores.masked_fill(mask == 0, float("-inf"))
@@ -112,10 +106,6 @@ class MultiHeadAttention(nn.Module):
         out = weights @ v
         out = out.transpose(1, 2).reshape(B, T, C)
         return self.fc(out)
-
-# ========================
-# Feed Forward
-# ========================
 
 class FeedForward(nn.Module):
     def __init__(self, d_model):
@@ -128,10 +118,6 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# ========================
-# Transformer Block
-# ========================
-
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, num_heads):
         super().__init__()
@@ -143,10 +129,6 @@ class TransformerBlock(nn.Module):
         x = x + self.attn(self.norm1(x))
         x = x + self.ff(self.norm2(x))
         return x
-
-# ========================
-# GPT Model
-# ========================
 
 class GPT(nn.Module):
     def __init__(self):
@@ -161,64 +143,38 @@ class GPT(nn.Module):
         x = self.pos(x)
         x = self.blocks(x)
         x = self.norm(x)
-        logits = self.fc(x)
-        return logits
+        return self.fc(x)
 
 # ========================
-# Initialize model
+# Initialize
 # ========================
-
 model = GPT().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 loss_fn = nn.CrossEntropyLoss()
+scaler = GradScaler()
 
 if os.path.exists(MODEL_FILE):
     print("Loading saved model...")
     model.load_state_dict(torch.load(MODEL_FILE))
 
 # ========================
-# Training loop
+# Training loop with mixed precision + gradient accumulation
 # ========================
-
-print("Training...")
-
+print("Training with mixed precision and gradient accumulation...")
 for step in range(EPOCHS):
-    x, y = get_batch()
-    logits = model(x)
-    loss = loss_fn(logits.view(-1, vocab_size), y.view(-1))
     optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    if step % 100 == 0:
-        print(f"Step {step}, Loss: {loss.item():.4f}")
+    total_loss = 0
+    for acc_step in range(ACCUM_STEPS):
+        x, y = get_batch()
+        with autocast():
+            logits = model(x)
+            loss = loss_fn(logits.view(-1, vocab_size), y.view(-1)) / ACCUM_STEPS
+        scaler.scale(loss).backward()
+        total_loss += loss.item()
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad()
+
+    if step % 50 == 0:
+        print(f"Step {step}, Loss: {total_loss:.4f}")
         torch.save(model.state_dict(), MODEL_FILE)
-
-# ========================
-# Text generation with temperature and top-k
-# ========================
-
-def generate(start_text, temperature=TEMPERATURE, top_k=TOP_K):
-    model.eval()
-    tokens = sp.EncodeAsIds(start_text)
-    x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
-    for _ in range(GENERATE_LEN):
-        logits = model(x)
-        last = logits[:, -1, :]
-        last = last / temperature
-        if top_k > 0:
-            top_values, top_indices = torch.topk(last, top_k)
-            probs = torch.zeros_like(last).scatter_(-1, top_indices, F.softmax(top_values, dim=-1))
-        else:
-            probs = F.softmax(last, dim=-1)
-        next_token = torch.multinomial(probs, 1)
-        x = torch.cat([x, next_token], dim=1)
-        if x.size(1) > SEQ_LEN:
-            x = x[:, -SEQ_LEN:]
-    return sp.DecodeIds(x.squeeze().tolist())
-
-# ========================
-# Generate sample
-# ========================
-
-print("\nGenerated text:\n")
-print(generate("Once upon a time "))
